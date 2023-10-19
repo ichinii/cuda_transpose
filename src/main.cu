@@ -8,19 +8,19 @@
 
 #include <glm/glm.hpp>
 
-constexpr const unsigned int W = 128;
-// constexpr const unsigned int W = 1<<11;
-constexpr const unsigned int S = W*W;
+using namespace glm;
+using namespace std::chrono_literals;
+
+// constexpr const unsigned int W = 128;
+constexpr const uint W = 1<<13;
+constexpr const uint S = W*W;
 static_assert(W % 32 == 0);
-static_assert(W <= 0xffffffff/2);
+static_assert(W <= 1<<16);
 
 constexpr const unsigned int BLOCK_SIZE = 128;
 [[maybe_unused]] constexpr const unsigned int GRID_SIZE = S / BLOCK_SIZE;
 [[maybe_unused]] constexpr const unsigned int GRID_SIZE_STRIDED = std::min(128u, GRID_SIZE);
 static_assert(S == GRID_SIZE * BLOCK_SIZE);
-
-using namespace glm;
-using namespace std::chrono_literals;
 
 __device__
 __forceinline__
@@ -96,7 +96,7 @@ float Q_rsqrt(float number) {
     i  = 0x5f3759df - ( i >> 1 );               // what the fuck? 
     y  = * ( float * ) &i;
     y  = y * ( threehalfs - ( x2 * y * y ) );   // 1st iteration
-    //y  = y * ( threehalfs - ( x2 * y * y ) );   // 2nd iteration,
+    // y  = y * ( threehalfs - ( x2 * y * y ) );   // 2nd iteration,
 
     return y;
 }
@@ -429,7 +429,8 @@ std::string run_experiments_for_element_sizes(uint8 *expected, uvec2 c, Fn fn) {
         << experiment<uint8> (expected, c, fn)
         << experiment<uint16>(expected, c, fn)
         << experiment<uint32>(expected, c, fn)
-        << experiment<uint64>(expected, c, fn);
+        << experiment<uint64>(expected, c, fn)
+    ;
     return ss.str();
 }
 
@@ -466,8 +467,8 @@ int main()
     cudaMalloc(&expected, S * sizeof(*expected));
     init_data<true>(expected);
 
-    {
-        ss << "\tlets first test the helper functions" << std::endl;
+    if constexpr (true) {
+        ss << "lets first test the helper functions" << std::endl;
         {
             int32 *data;
             cudaMalloc(&data, S * sizeof(*data));
@@ -516,7 +517,6 @@ int main()
                 << "compare(different)   ok=" << !static_cast<bool>(result_false) << std::endl
                 << "compare(different)   ok=" << !static_cast<bool>(result_false2) << std::endl;
         }
-
         ss << std::endl;
     }
 
