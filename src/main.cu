@@ -8,8 +8,8 @@
 
 #include <glm/glm.hpp>
 
-// constexpr const unsigned int W = 256;
-constexpr const unsigned int W = 1<<10;
+constexpr const unsigned int W = 128;
+// constexpr const unsigned int W = 1<<11;
 constexpr const unsigned int S = W*W;
 static_assert(W % 32 == 0);
 static_assert(W <= 0xffffffff/2);
@@ -44,82 +44,144 @@ void transpose_naive(T *dst, T *src, int w) {
     dst[dst_id] = src[src_id];
 }
 
-template <typename T>
+template <uint BLOCK_DIM_X, uint BLOCK_DIM_Y, typename T>
 __global__
-void transpose_coalesced_bankconflict(T *dst, T *src, int w) {
-    unsigned int o0 = blockIdx.x * 32 + blockIdx.y * 32 * w;
-    unsigned int o1 = blockIdx.y * 32 + blockIdx.x * 32 * w;
+void transpose_coalesced_bankconflict(T *dst, T *src) {
+    __shared__ T data[BLOCK_DIM_X][BLOCK_DIM_X];
 
-    constexpr const uint8 X = 32;
-    __shared__ int data[32*X];
+    uint w = gridDim.x * BLOCK_DIM_X;
+    uint ox = threadIdx.x + blockIdx.x*BLOCK_DIM_X;
+    uint oy = threadIdx.y + blockIdx.y*BLOCK_DIM_X;
 
-    for (int y = 0; y < 32; y += blockDim.y) {
-        int pi = threadIdx.x + (y + threadIdx.y) * w;
-        int di = threadIdx.y + y + threadIdx.x * X;
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y)
+        data[threadIdx.y+y][threadIdx.x] = src[ox + (oy+y) * w];
 
-        T p = src[pi + o0];
-        data[di] = p;
+    __syncthreads();
+    ox = threadIdx.x + blockIdx.y*BLOCK_DIM_X;
+    oy = threadIdx.y + blockIdx.x*BLOCK_DIM_X;
+
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y)
+        dst[ox + (oy+y) * w] = data[threadIdx.x][threadIdx.y+y];
+}
+
+template <uint BLOCK_DIM_X, uint BLOCK_DIM_Y, typename T>
+__global__
+void transpose_coalesced(T *dst, T *src) {
+    __shared__ T data[BLOCK_DIM_X][BLOCK_DIM_X + 1];
+
+    uint w = gridDim.x * BLOCK_DIM_X;
+    uint ox = threadIdx.x + blockIdx.x*BLOCK_DIM_X;
+    uint oy = threadIdx.y + blockIdx.y*BLOCK_DIM_X;
+
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y)
+        data[threadIdx.y+y][threadIdx.x] = src[ox + (oy+y) * w];
+
+    __syncthreads();
+    ox = threadIdx.x + blockIdx.y*BLOCK_DIM_X;
+    oy = threadIdx.y + blockIdx.x*BLOCK_DIM_X;
+
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y)
+        dst[ox + (oy+y) * w] = data[threadIdx.x][threadIdx.y+y];
+}
+
+__device__
+float Q_rsqrt(float number) {
+    long i;
+    float x2, y;
+    const float threehalfs = 1.5F;
+
+    x2 = number * 0.5F;
+    y  = number;
+    i  = * ( long * ) &y;    // evil floating point bit level hacking
+    i  = 0x5f3759df - ( i >> 1 );               // what the fuck? 
+    y  = * ( float * ) &i;
+    y  = y * ( threehalfs - ( x2 * y * y ) );   // 1st iteration
+    //y  = y * ( threehalfs - ( x2 * y * y ) );   // 2nd iteration,
+
+    return y;
+}
+
+__device__
+ivec2 index_to_tricoord(int i) {
+    // int y = 1.0/Q_rsqrt(0.25f + 2.0f*i) - 0.5f;
+    int y = sqrt(0.25f + 2.0f*i) - 0.5f;
+    int x = i - y*(y+1)/2;
+    return ivec2(x, y);
+}
+
+int tricoord_to_index(ivec2 v) {
+    return v.x + v.y*(v.y+1)/2;
+}
+
+template <uint BLOCK_DIM_X, uint BLOCK_DIM_Y, typename T>
+__global__
+void transpose_triangle(T *src, uint w) {
+    uvec2 tile = index_to_tricoord(blockIdx.x);
+
+    __shared__ T data0[BLOCK_DIM_X][BLOCK_DIM_X + 1];
+    __shared__ T data1[BLOCK_DIM_X][BLOCK_DIM_X + 1];
+
+    uint ox0 = threadIdx.x + tile.x*BLOCK_DIM_X;
+    uint oy0 = threadIdx.y + tile.y*BLOCK_DIM_X;
+    uint ox1 = threadIdx.x + tile.y*BLOCK_DIM_X;
+    uint oy1 = threadIdx.y + tile.x*BLOCK_DIM_X;
+
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y) {
+        data0[threadIdx.y+y][threadIdx.x] = src[ox0 + (oy0+y) * w];
+        data1[threadIdx.y+y][threadIdx.x] = src[ox1 + (oy1+y) * w];
     }
 
     __syncthreads();
 
-    for (int y = 0; y < 32; y += blockDim.y) {
-        int pi = threadIdx.x + (y + threadIdx.y) * w;
-        int di = threadIdx.x + (y + threadIdx.y) * X;
-
-        dst[pi + o1] = data[di];
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y) {
+        src[ox0 + (oy0+y) * w] = data1[threadIdx.x][threadIdx.y+y];
+        src[ox1 + (oy1+y) * w] = data0[threadIdx.x][threadIdx.y+y];
     }
 }
 
-template <typename T>
+template <uint BLOCK_DIM_X, uint BLOCK_DIM_Y, typename T>
 __global__
-void transpose_coalesced(T *dst, T *src, int w) {
-    unsigned int o0 = blockIdx.x * 32 + blockIdx.y * 32 * w;
-    unsigned int o1 = blockIdx.y * 32 + blockIdx.x * 32 * w;
+void transpose_triangle_diag(T *src) {
+    __shared__ T data[BLOCK_DIM_X][BLOCK_DIM_X + 1];
 
-    constexpr const uint8 X = 33;
-    __shared__ int data[32*X];
+    uint w = gridDim.x * BLOCK_DIM_X;
+    uint ox = threadIdx.x + blockIdx.x*BLOCK_DIM_X;
+    uint oy = threadIdx.y + blockIdx.x*BLOCK_DIM_X;
 
-    for (int y = 0; y < 32; y += blockDim.y) {
-        int pi = threadIdx.x + (y + threadIdx.y) * w;
-        int di = threadIdx.y + y + threadIdx.x * X;
-
-        T p = src[pi + o0];
-        data[di] = p;
-    }
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y)
+        data[threadIdx.y+y][threadIdx.x] = src[ox + (oy+y) * w];
 
     __syncthreads();
 
-    for (int y = 0; y < 32; y += blockDim.y) {
-        int pi = threadIdx.x + (y + threadIdx.y) * w;
-        int di = threadIdx.x + (y + threadIdx.y) * X;
-
-        dst[pi + o1] = data[di];
-    }
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y)
+        src[ox + (oy+y) * w] = data[threadIdx.x][threadIdx.y+y];
 }
 
-template <typename T>
+template <uint BLOCK_DIM_X, uint BLOCK_DIM_Y, typename T>
 __global__
-void transposeCoalesced(T *odata, const T *idata) {
-    constexpr const int TILE_DIM = 32;
-    constexpr const int BLOCK_ROWS = 4;
+void transpose_triangle_internal(T *src, uint w) {
+    uvec2 tile = index_to_tricoord(blockIdx.x);
+    tile.y += 1;
 
-    __shared__ float tile[TILE_DIM][TILE_DIM+1];
+    __shared__ T data0[BLOCK_DIM_X][BLOCK_DIM_X + 1];
+    __shared__ T data1[BLOCK_DIM_X][BLOCK_DIM_X + 1];
 
-    int x = blockIdx.x * TILE_DIM + threadIdx.x;
-    int y = blockIdx.y * TILE_DIM + threadIdx.y;
-    int width = gridDim.x * TILE_DIM;
+    uint ox0 = threadIdx.x + tile.x*BLOCK_DIM_X;
+    uint oy0 = threadIdx.y + tile.y*BLOCK_DIM_X;
+    uint ox1 = threadIdx.x + tile.y*BLOCK_DIM_X;
+    uint oy1 = threadIdx.y + tile.x*BLOCK_DIM_X;
 
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-        tile[threadIdx.y+j][threadIdx.x] = idata[(y+j)*width + x];
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y) {
+        data0[threadIdx.y+y][threadIdx.x] = src[ox0 + (oy0+y) * w];
+        data1[threadIdx.y+y][threadIdx.x] = src[ox1 + (oy1+y) * w];
+    }
 
     __syncthreads();
 
-    x = blockIdx.y * TILE_DIM + threadIdx.x;  // transpose block offset
-    y = blockIdx.x * TILE_DIM + threadIdx.y;
-
-    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-        odata[(y+j)*width + x] = tile[threadIdx.x][threadIdx.y + j];
+    for (uint y = 0; y < BLOCK_DIM_X; y += BLOCK_DIM_Y) {
+        src[ox0 + (oy0+y) * w] = data1[threadIdx.x][threadIdx.y+y];
+        src[ox1 + (oy1+y) * w] = data0[threadIdx.x][threadIdx.y+y];
+    }
 }
 
 #define CHECK_LAST_CUDA_ERROR() checkLastError(__FILE__, __LINE__)
@@ -246,7 +308,7 @@ void reduce_once(T *dst, T *src, int b, int t, int n, ReduceOp<T> op, T identity
 }
 
 template <typename T>
-void dump(T* data_d, uint n, uint w=W) {
+void dump(T* data_d, uint n=S, uint w=W) {
     auto data = std::vector<T>(n);
     cudaMemcpy(data.data(), data_d, n * sizeof(T), cudaMemcpyDeviceToHost);
     std::cout << "\tdump" << std::endl;
@@ -343,6 +405,7 @@ std::string experiment(uint8 *expected, uvec2 c, Fn fn) {
     auto [dt_cpu, dt_gpu] = perf([&] {
         fn(c, output, input);
     });
+    CHECK_LAST_CUDA_ERROR();
 
     auto ok = compare(expected, output);
 
@@ -468,32 +531,53 @@ int main()
     };
 
     [[maybe_unused]] auto fn_1 = [] <typename T> (uvec2 c, T *output, T *input) {
-        transpose_coalesced_bankconflict<<<{W/32u, W/32u, 1u}, {c.x, c.y, 1u}>>>(output, input, W);
+        constexpr const uint X = 32;
+        constexpr const uint Y = 4;
+        transpose_coalesced_bankconflict<X, Y><<<{W/X, W/X, 1u}, {X, Y, 1u}>>>(output, input);
     };
 
     [[maybe_unused]] auto fn_2 = [] <typename T> (uvec2 c, T *output, T *input) {
-        transpose_coalesced<<<{W/32u, W/32u, 1u}, {c.x, c.y, 1u}>>>(output, input, W);
+        constexpr const uint X = 32;
+        constexpr const uint Y = 4;
+        transpose_coalesced<X, Y><<<{W/X, W/X, 1u}, {X, Y, 1u}>>>(output, input);
     };
 
-    [[maybe_unused]] auto fn_3 = [] <typename T> (uvec2 c, T *output, T *input) {
-        transposeCoalesced<<<{W/32u, W/32u, 1u}, {c.x, c.y, 1u}>>>(output, input);
+    [[maybe_unused]] auto fn_3 = [] <typename T> (uvec2 c, T *&output, T *&input) {
+        constexpr const uint X = 32;
+        constexpr const uint Y = 4;
+        uint B = tricoord_to_index(ivec2(W/X - 1, W/X - 1)) + 1;
+        transpose_triangle<X, Y><<<{B, 1u, 1u}, {X, Y, 1u}>>>(input, W);
+        std::swap(output, input);
+    };
+
+    [[maybe_unused]] auto fn_4 = [] <typename T> (uvec2 c, T *&output, T *&input) {
+        constexpr const uint X = 32;
+        constexpr const uint Y = 4;
+        uint B = tricoord_to_index(ivec2(W/X - 2, W/X - 2)) + 1;
+        transpose_triangle_internal<X, Y><<<{B, 1u, 1u}, {X, Y, 1u}>>>(input, W);
+        transpose_triangle_diag<X, Y><<<{W/X, 1u, 1u}, {X, Y, 1u}>>>(input);
+        std::swap(output, input);
     };
 
     ss
-        << "\ttranspose_naive" << std::endl
+        << "transpose_naive" << std::endl
         << run_experiments_for_element_sizes(expected, {4, 32}, fn_0)
         << std::endl
 
-        << "\ttranspose_coalesced_bankconflict" << std::endl
-        << run_experiments_for_element_sizes(expected, {32, 4}, fn_1)
+        << "transpose_coalesced_bankconflict" << std::endl
+        << run_experiments_for_element_sizes(expected, {}, fn_1)
         << std::endl
 
-        << "\ttranspose_coalesced" << std::endl
-        << run_experiments_for_element_sizes(expected, {32, 4}, fn_2)
+        << "transpose_coalesced" << std::endl
+        << run_experiments_for_element_sizes(expected, {}, fn_2)
         << std::endl
 
-        << "\ttransposeCoalesced" << std::endl
-        << run_experiments_for_element_sizes(expected, {32, 4}, fn_3)
+        << "transpose_triangle" << std::endl
+        << run_experiments_for_element_sizes(expected, {}, fn_3)
+        << std::endl
+
+        << "transpose_triangle separate diag&internal" << std::endl
+        << run_experiments_for_element_sizes(expected, {}, fn_4)
         << std::endl
     ;
 
