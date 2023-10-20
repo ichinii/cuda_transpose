@@ -38,9 +38,8 @@ AddTool(function(s)
     s.cu = {}
     s.cu.flags_compile = {}
     table.insert(s.cu.flags_compile, "-diag-suppress 20012") -- glm
-    table.insert(s.cu.flags_compile, "-diag-suppress 3012")  -- depricated volatile
     table.insert(s.cu.flags_compile, "--std=c++20")
-    -- table.insert(s.cu.flags_compile, "--expt-relaxed-constexpr")
+    table.insert(s.cu.flags_compile, "--expt-relaxed-constexpr")
     -- table.insert(s.cu.flags_compile, "--extended-lambda")
     s.cu.flags_link = {}
     s.cu.flags = {}
