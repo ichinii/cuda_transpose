@@ -311,6 +311,7 @@ void reduce_once(T *dst, T *src, int b, int t, int n, OpFn op, T identity_op) {
 
 // TODO: T in OpFn can be omitted on caller site
 // ^ something like template <typename> typename OpFn> and use parameter OpFn<T>
+// TODO: op should not be a parameter, bc its an empty class anyways
 // TODO: for OpFn enable simply passing labmda.
 // ^ to reduce instances of this template, are calls wtih identical lambdas collapsed into single instance?
 template <typename T, typename OpFn>
@@ -427,27 +428,11 @@ std::string run_experiments_for_element_sizes(uint8 *expected, uvec2 c, Fn fn) {
     return ss.str();
 }
 
-using InitRangePred = int8(*)(uint);
-
-__device__
-int8 pred_one(uint i) {
-    return 1;
-}
-
-__device__
-InitRangePred p_pred_one = pred_one;
-
 template <typename T>
 __global__
-void init_range(T *dst, InitRangePred pred) {
+void init_range_with_one(T *dst) {
     uint i = threadIdx.x + blockIdx.x*blockDim.x;
-    dst[i] = pred(i);
-}
-
-InitRangePred get_pred_one() {
-    InitRangePred pred;
-    cudaMemcpyFromSymbol(&pred, p_pred_one, sizeof(InitRangePred));
-    return pred;
+    dst[i] = 1;
 }
 
 int main()
@@ -465,7 +450,7 @@ int main()
         {
             int32 *data;
             cudaMalloc(&data, S * sizeof(*data));
-            init_range<<<GRID_SIZE, BLOCK_SIZE>>>(data, get_pred_one());
+            init_range_with_one<<<GRID_SIZE, BLOCK_SIZE>>>(data);
             int32 sum = reduce(data, AdditionOp<int32>(), 0);
             cudaFree(data);
 
@@ -475,10 +460,10 @@ int main()
         {
             uint8 *data;
             cudaMalloc(&data, S * sizeof(*data));
-            init_range<<<GRID_SIZE, BLOCK_SIZE>>>(data, get_pred_one());
+            init_range_with_one<<<GRID_SIZE, BLOCK_SIZE>>>(data);
             auto result_true = reduce(data, BinaryAndOp<uint8>(), static_cast<uint8>(1));
 
-            init_range<<<GRID_SIZE, BLOCK_SIZE>>>(data, get_pred_one());
+            init_range_with_one<<<GRID_SIZE, BLOCK_SIZE>>>(data);
             uint8 zero = 0;
             cudaMemcpy(data, &zero, sizeof(uint8), cudaMemcpyHostToDevice);
             auto result_false = reduce(data, BinaryAndOp<uint8>(), static_cast<uint8>(1));
