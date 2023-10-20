@@ -17,10 +17,10 @@ constexpr const uint S = W*W;
 static_assert(W % 32 == 0);
 static_assert(W <= 1<<16);
 
-constexpr const unsigned int BLOCK_SIZE = 128;
-[[maybe_unused]] constexpr const unsigned int GRID_SIZE = S / BLOCK_SIZE;
-[[maybe_unused]] constexpr const unsigned int GRID_SIZE_STRIDED = std::min(128u, GRID_SIZE);
-static_assert(S == GRID_SIZE * BLOCK_SIZE);
+constexpr const unsigned int BLOCK = 128;
+[[maybe_unused]] constexpr const unsigned int GRID = S / BLOCK;
+[[maybe_unused]] constexpr const unsigned int GRID_STRIDED = std::min(128u, GRID);
+static_assert(S == GRID * BLOCK);
 
 __device__
 __forceinline__
@@ -103,6 +103,7 @@ float Q_rsqrt(float number) {
 
 __device__
 ivec2 index_to_tricoord(int i) {
+    // TODO: select good sqrt function
     // int y = 1.0/Q_rsqrt(0.25f + 2.0f*i) - 0.5f;
     int y = sqrt(0.25f + 2.0f*i) - 0.5f;
     int x = i - y*(y+1)/2;
@@ -205,6 +206,7 @@ void dump(T* data_d, uint n=S, uint w=W) {
     }
     std::cout << std::endl;
 }
+
 
 template <bool Transposed, typename T>
 __global__
@@ -320,13 +322,13 @@ T reduce(T *src, OpFn op, T identity_op) {
     cudaMalloc(&dst, S * sizeof(T));
     T *markForFree = dst;
 
-    uint r = BLOCK_SIZE*2;
+    uint r = BLOCK*2;
     uint n = S;
 
     while (1 < n) {
         uint b = std::max(1u, n/r);
-        b = std::min(b, GRID_SIZE_STRIDED);
-        uint t = std::min(BLOCK_SIZE, n/2);
+        b = std::min(b, GRID_STRIDED);
+        uint t = std::min(BLOCK, n/2);
         reduce_once(dst, src, b, t, n, op, identity_op);
         n = b;
         std::swap(dst, src);
@@ -430,9 +432,16 @@ std::string run_experiments_for_element_sizes(uint8 *expected, uvec2 c, Fn fn) {
 
 template <typename T>
 __global__
-void init_range_with_one(T *dst) {
+void set_range(T *dst, T v) {
     uint i = threadIdx.x + blockIdx.x*blockDim.x;
-    dst[i] = 1;
+    dst[i] = v;
+}
+
+template <typename T, typename Fn>
+__global__
+void set_range_pred(T *dst, Fn pred) {
+    uint i = threadIdx.x + blockIdx.x*blockDim.x;
+    dst[i] = pred(i);
 }
 
 int main()
@@ -450,7 +459,7 @@ int main()
         {
             int32 *data;
             cudaMalloc(&data, S * sizeof(*data));
-            init_range_with_one<<<GRID_SIZE, BLOCK_SIZE>>>(data);
+            set_range<<<GRID, BLOCK>>>(data, static_cast<int32>(1));
             int32 sum = reduce(data, AdditionOp<int32>(), 0);
             cudaFree(data);
 
@@ -460,10 +469,10 @@ int main()
         {
             uint8 *data;
             cudaMalloc(&data, S * sizeof(*data));
-            init_range_with_one<<<GRID_SIZE, BLOCK_SIZE>>>(data);
+            set_range<<<GRID, BLOCK>>>(data, static_cast<uint8>(1));
             auto result_true = reduce(data, BinaryAndOp<uint8>(), static_cast<uint8>(1));
 
-            init_range_with_one<<<GRID_SIZE, BLOCK_SIZE>>>(data);
+            set_range<<<GRID, BLOCK>>>(data, static_cast<uint8>(1));
             uint8 zero = 0;
             cudaMemcpy(data, &zero, sizeof(uint8), cudaMemcpyHostToDevice);
             auto result_false = reduce(data, BinaryAndOp<uint8>(), static_cast<uint8>(1));

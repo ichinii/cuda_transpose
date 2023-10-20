@@ -40,7 +40,7 @@ AddTool(function(s)
     table.insert(s.cu.flags_compile, "-diag-suppress 20012") -- glm
     table.insert(s.cu.flags_compile, "--std=c++20")
     table.insert(s.cu.flags_compile, "--expt-relaxed-constexpr")
-    -- table.insert(s.cu.flags_compile, "--extended-lambda")
+    table.insert(s.cu.flags_compile, "--extended-lambda")
     s.cu.flags_link = {}
     s.cu.flags = {}
     s.name = "default"
