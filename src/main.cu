@@ -12,7 +12,7 @@ using namespace glm;
 using namespace std::chrono_literals;
 
 // constexpr const unsigned int W = 128;
-constexpr const uint W = 1<<13;
+constexpr const uint W = 1<<11;
 constexpr const uint S = W*W;
 static_assert(W % 32 == 0);
 static_assert(W <= 1<<16);
@@ -193,6 +193,19 @@ inline void checkLastError(const char* const file, const int line) {
     }
 }
 
+template <typename T>
+void dump(T* data_d, uint n=S, uint w=W) {
+    auto data = std::vector<T>(n);
+    cudaMemcpy(data.data(), data_d, n * sizeof(T), cudaMemcpyDeviceToHost);
+    std::cout << "\tdump" << std::endl;
+    for (int i = 0; i < n; ++i) {
+        if (i != 0 && i % w == 0)
+            std::cout << std::endl;
+        std::cout << (int64)data[i] << " ";
+    }
+    std::cout << std::endl;
+}
+
 template <bool Transposed, typename T>
 __global__
 void init_data_k(T *output) {
@@ -213,45 +226,28 @@ void init_data(T *output) {
 }
 
 template <typename T>
-using ReduceOp = T(*)(T, T);
+struct AdditionOp {
+    __device__ __host__
+    __forceinline__ // TODO
+    T operator()(T a, T b) { return a + b; }
+};
 
 template <typename T>
-__device__
-T op_add(T a, T b) {
-    return a + b;
+struct BinaryAndOp {
+    __device__ __host__
+    T operator()(T a, T b) { return a && b; }
+};
+
+constexpr inline bool is_power_of_2(int n) {
+    return (n & (n-1)) == 0;
 }
-
-__device__
-uint8 op_binary_or(uint8 a, uint8 b) {
-    return a && b;
-}
-
-__device__ ReduceOp<int32> p_op_add_int32 = op_add<int32>;
-__device__ ReduceOp<uint8> p_op_binary_or = op_binary_or;
-
-template <typename T>
-ReduceOp<T> get_reduce_op_add() {
-    ReduceOp<T> op;
-    static_assert(std::is_same_v<T, int32>);
-    cudaMemcpyFromSymbol(&op, p_op_add_int32, sizeof(ReduceOp<T>));
-    return op;
-}
-
-ReduceOp<uint8> get_reduce_op_binary_and() {
-    ReduceOp<uint8> op;
-    cudaMemcpyFromSymbol(&op, p_op_binary_or, sizeof(ReduceOp<uint8>));
-    return op;
-}
-
-constexpr const uint8 identity_binary_op = 1;
-constexpr const int32 identity_op_add = 0;
 
 /* begin
  * Mark Harris NVIDIA Developer Technology
  */
-template <unsigned int blockSize, typename T>
+template <unsigned int blockSize, typename T, typename OpFn>
 __device__
-void warpReduce(volatile T *sdata, unsigned int tid, ReduceOp<T> op) {
+void warpReduce(volatile T *sdata, unsigned int tid, OpFn op) {
     if (blockSize >= 64) sdata[tid] = op(sdata[tid], sdata[tid + 32]);
     if (blockSize >= 32) sdata[tid] = op(sdata[tid], sdata[tid + 16]);
     if (blockSize >= 16) sdata[tid] = op(sdata[tid], sdata[tid + 8]);
@@ -260,9 +256,20 @@ void warpReduce(volatile T *sdata, unsigned int tid, ReduceOp<T> op) {
     if (blockSize >= 2)  sdata[tid] = op(sdata[tid], sdata[tid + 1]);
 }
 
-template <unsigned int blockSize, typename T>
+template <unsigned int blockSize, typename T, typename OpFn>
+__device__
+void warpReduce_shfl(T &x, OpFn op) {
+    constexpr const uint32 mask = 0xffffffff;
+    if constexpr (blockSize >= 32) x = op(x, __shfl_down_sync(mask, x, 16));
+    if constexpr (blockSize >= 16) x = op(x, __shfl_down_sync(mask, x,  8));
+    if constexpr (blockSize >=  8) x = op(x, __shfl_down_sync(mask, x,  4));
+    if constexpr (blockSize >=  4) x = op(x, __shfl_down_sync(mask, x,  2));
+    if constexpr (blockSize >=  2) x = op(x, __shfl_down_sync(mask, x,  1));
+}
+
+template <unsigned int blockSize, typename T, typename OpFn>
 __global__
-void reduce_k(T *g_odata, T *g_idata, unsigned int n, ReduceOp<T> op, T identity_op) {
+void reduce_k(T *g_odata, T *g_idata, unsigned int n, OpFn op, T identity_op) {
     extern __shared__ /*__align__(sizeof(T))*/ uint8 sdata_[];
     T *sdata = reinterpret_cast<T*>(sdata_);
     unsigned int tid = threadIdx.x;
@@ -271,22 +278,32 @@ void reduce_k(T *g_odata, T *g_idata, unsigned int n, ReduceOp<T> op, T identity
     sdata[tid] = identity_op;
     while (i < n) { sdata[tid] = op(sdata[tid], op(g_idata[i], g_idata[i+blockSize])); i += gridSize; }
     __syncthreads();
-    if (blockSize >= 512) { if (tid < 256) { sdata[tid] = op(sdata[tid], sdata[tid + 256]); } __syncthreads(); }
-    if (blockSize >= 256) { if (tid < 128) { sdata[tid] = op(sdata[tid], sdata[tid + 128]); } __syncthreads(); }
-    if (blockSize >= 128) { if (tid < 64)  { sdata[tid] = op(sdata[tid], sdata[tid + 64]);  } __syncthreads(); }
-    if (tid < 32) warpReduce<blockSize>(sdata, tid, op);
-    if (tid == 0) g_odata[blockIdx.x] = sdata[0];
+    if constexpr (blockSize >= 512)
+        { if (tid < 256) { sdata[tid] = op(sdata[tid], sdata[tid + 256]); } __syncthreads(); }
+    if constexpr (blockSize >= 256)
+        { if (tid < 128) { sdata[tid] = op(sdata[tid], sdata[tid + 128]); } __syncthreads(); }
+    if constexpr (blockSize >= 128)
+        { if (tid < 64)  { sdata[tid] = op(sdata[tid], sdata[tid + 64]);  } __syncthreads(); }
+
+    // if (tid < 32) warpReduce<blockSize>(sdata, tid, op);
+    // if (tid == 0)
+    //     g_odata[blockIdx.x] = sdata[0];
+
+    if constexpr (blockSize >= 64)
+        { if (tid < 32)  { sdata[tid] = op(sdata[tid], sdata[tid + 32]);  } __syncthreads(); } // TODO
+    if (tid < 32) {
+        T x = sdata[tid];
+        warpReduce_shfl<blockSize>(x, op);
+        if (tid == 0)
+            g_odata[blockIdx.x] = x;
+    }
 }
 /* end
  * Mark Harris NVIDIA Developer Technology
  */
 
-constexpr inline bool is_power_of_2(int n) {
-    return (n & (n-1)) == 0;
-}
-
-template <typename T>
-void reduce_once(T *dst, T *src, int b, int t, int n, ReduceOp<T> op, T identity_op) {
+template <typename T, typename OpFn>
+void reduce_once(T *dst, T *src, int b, int t, int n, OpFn op, T identity_op) {
     assert(t <= 512);
     assert(is_power_of_2(t));
 
@@ -304,24 +321,15 @@ void reduce_once(T *dst, T *src, int b, int t, int n, ReduceOp<T> op, T identity
         BlockSizeCase(  1)
         default: assert(false); break;
     }
-#undef sum_case
+#undef BlockSizeCase
 }
 
-template <typename T>
-void dump(T* data_d, uint n=S, uint w=W) {
-    auto data = std::vector<T>(n);
-    cudaMemcpy(data.data(), data_d, n * sizeof(T), cudaMemcpyDeviceToHost);
-    std::cout << "\tdump" << std::endl;
-    for (int i = 0; i < n; ++i) {
-        if (i != 0 && i % w == 0)
-            std::cout << std::endl;
-        std::cout << (int64)data[i] << " ";
-    }
-    std::cout << std::endl;
-}
-
-template <typename T>
-T reduce(T *src, ReduceOp<T> op, T identity_op) {
+// TODO: T in OpFn can be omitted on caller site
+// ^ something like template <typename> typename OpFn> and use parameter OpFn<T>
+// TODO: for OpFn enable simply passing labmda.
+// ^ to reduce instances of this template, are calls wtih identical lambdas collapsed into single instance?
+template <typename T, typename OpFn>
+T reduce(T *src, OpFn op, T identity_op) {
     T *dst;
     cudaMalloc(&dst, S * sizeof(T));
     T *markForFree = dst;
@@ -362,7 +370,7 @@ bool compare(T *a, U *b) {
     cudaMalloc(&result, S * sizeof(*result));
     compare_k<<<{W/32u, W/32u, 1u}, {32u, 4u, 1u}>>>(result, a, b);
 
-    bool result_h = reduce(result, get_reduce_op_binary_and(), identity_binary_op);
+    bool result_h = reduce(result, BinaryAndOp<uint8>(), static_cast<uint8>(1));
     cudaFree(result);
     return result_h;
 }
@@ -473,27 +481,32 @@ int main()
             int32 *data;
             cudaMalloc(&data, S * sizeof(*data));
             init_range<<<GRID_SIZE, BLOCK_SIZE>>>(data, get_pred_one());
-            auto sum = reduce(data, get_reduce_op_add<int32>(), identity_op_add);
+            int32 sum;
+            auto [dt_cpu, dt_gpu] = perf([&] {
+                sum = reduce(data, AdditionOp<int32>(), 0);
+            });
             cudaFree(data);
 
+            ss << "reduce dt_cpu=" << dt_cpu << " dt_gpu=" << dt_gpu << std::endl;
+
             ss
-                << "reduce(op=add)       ok=" << (sum == S) << std::endl;
+                << "reduce(op=add)        ok=" << (sum == S) << std::endl;
         }
         {
             uint8 *data;
             cudaMalloc(&data, S * sizeof(*data));
             init_range<<<GRID_SIZE, BLOCK_SIZE>>>(data, get_pred_one());
-            auto result_true = reduce(data, get_reduce_op_binary_and(), identity_binary_op);
+            auto result_true = reduce(data, BinaryAndOp<uint8>(), static_cast<uint8>(1));
 
             init_range<<<GRID_SIZE, BLOCK_SIZE>>>(data, get_pred_one());
             uint8 zero = 0;
             cudaMemcpy(data, &zero, sizeof(uint8), cudaMemcpyHostToDevice);
-            auto result_false = reduce(data, get_reduce_op_binary_and(), identity_binary_op);
+            auto result_false = reduce(data, BinaryAndOp<uint8>(), static_cast<uint8>(1));
             cudaFree(data);
 
             ss
-                << "reduce(op=binary_or) ok=" << static_cast<bool>(result_true) << std::endl
-                << "reduce(op=binary_or) ok=" << !static_cast<bool>(result_false) << std::endl;
+                << "reduce(op=binary_and) ok=" << static_cast<bool>(result_true) << std::endl
+                << "reduce(op=binary_and) ok=" << !static_cast<bool>(result_false) << std::endl;
         }
         {
             uint8 *data, *data2, *data_transposed;
@@ -513,9 +526,9 @@ int main()
             cudaFree(data_transposed);
 
             ss
-                << "compare(equal)       ok=" << static_cast<bool>(result_true) << std::endl
-                << "compare(different)   ok=" << !static_cast<bool>(result_false) << std::endl
-                << "compare(different)   ok=" << !static_cast<bool>(result_false2) << std::endl;
+                << "compare(equal)        ok=" << static_cast<bool>(result_true) << std::endl
+                << "compare(different)    ok=" << !static_cast<bool>(result_false) << std::endl
+                << "compare(different)    ok=" << !static_cast<bool>(result_false2) << std::endl;
         }
         ss << std::endl;
     }
@@ -559,27 +572,27 @@ int main()
         std::swap(output, input);
     };
 
-    ss
-        << "transpose_naive" << std::endl
-        << run_experiments_for_element_sizes(expected, {4, 32}, fn_0)
-        << std::endl
+    // ss
+        // << "transpose_naive" << std::endl
+        // << run_experiments_for_element_sizes(expected, {4, 32}, fn_0)
+        // << std::endl
 
-        << "transpose_coalesced_bankconflict" << std::endl
-        << run_experiments_for_element_sizes(expected, {}, fn_1)
-        << std::endl
+        // << "transpose_coalesced_bankconflict" << std::endl
+        // << run_experiments_for_element_sizes(expected, {}, fn_1)
+        // << std::endl
 
-        << "transpose_coalesced" << std::endl
-        << run_experiments_for_element_sizes(expected, {}, fn_2)
-        << std::endl
+        // << "transpose_coalesced" << std::endl
+        // << run_experiments_for_element_sizes(expected, {}, fn_2)
+        // << std::endl
 
-        << "transpose_triangle" << std::endl
-        << run_experiments_for_element_sizes(expected, {}, fn_3)
-        << std::endl
+        // << "transpose_triangle" << std::endl
+        // << run_experiments_for_element_sizes(expected, {}, fn_3)
+        // << std::endl
 
-        << "transpose_triangle separate diag&internal" << std::endl
-        << run_experiments_for_element_sizes(expected, {}, fn_4)
-        << std::endl
-    ;
+        // << "transpose_triangle separate diag&internal" << std::endl
+        // << run_experiments_for_element_sizes(expected, {}, fn_4)
+        // << std::endl
+    // ;
 
     cudaFree(expected);
     std::cout << ss.str();
