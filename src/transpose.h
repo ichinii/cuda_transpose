@@ -43,6 +43,9 @@ void transpose_coalesced_bankconflict(T *dst, T *src) {
 template <uint BLOCK_DIM_X, uint BLOCK_DIM_Y, typename T>
 __global__
 void transpose_coalesced(T *dst, T *src) {
+    static_assert(BLOCK_DIM_Y <= BLOCK_DIM_X);
+    static_assert(BLOCK_DIM_X % BLOCK_DIM_Y == 0);
+
     __shared__ T data[BLOCK_DIM_X][BLOCK_DIM_X + 1];
 
     uint w = gridDim.x * BLOCK_DIM_X;
